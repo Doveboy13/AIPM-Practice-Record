@@ -1,6 +1,94 @@
-前提：需要使用向量数据库ChromaDB来实现RAG技术的运用，分为本地comfy和调用第三方LLM api的环境。
+前提：需要使用向量数据库ChromaDB来实现RAG技术的运用，分为本地 ComfyUI 和调用第三方 LLM API 的环境。
 
 要在项目中落地RAG技术，核心就是构建一个“检索-增强生成”的闭环。下面拆解如何在本地环境和使用第三方API这两种主流模式下，用ChromaDB实现这一过程。
+
+## RAG 原理及完整流程示意
+
+> **RAG（Retrieval-Augmented Generation，检索增强生成）** 的核心思想：不让 LLM 凭记忆回答，而是先从知识库检索相关片段，再让 LLM 基于这些片段生成答案。完整流程分为 **离线索引（Indexing）** 与 **在线查询（Query）** 两阶段。
+
+### 整体架构（两阶段）
+
+```mermaid
+flowchart TB
+    subgraph offline ["阶段一：离线索引 Indexing（建库，低频）"]
+        rawDocs["原始文档 PDF/Markdown/网页"] --> loadDocs[文档加载 Load]
+        loadDocs --> chunkDocs["文本切分 Chunking langchain-text-splitters"]
+        chunkDocs --> embedDocs["向量化 Embedding Bi-Encoder"]
+        embedDocs --> chromaStore[("ChromaDB 向量库 ids+documents+embeddings")]
+    end
+
+    subgraph online ["阶段二：在线查询 Query（问答，高频）"]
+        userQuery[用户提问 User Query] --> queryEmbed[Query 向量化]
+        queryEmbed --> vectorSearch["向量相似度检索 ChromaDB Top-N"]
+        vectorSearch --> rerankCheck{Rerank 重排序 可选}
+        rerankCheck -->|启用| topKContext[精排后 Top-K 上下文]
+        rerankCheck -->|跳过| topKContext
+        topKContext --> promptBuild["Prompt 组装 Context+Question"]
+        promptBuild --> llmGen[LLM 生成答案]
+        llmGen --> userAnswer[返回用户]
+    end
+
+    chromaStore -.->|读取| vectorSearch
+```
+
+### 双方案对比流程
+
+```mermaid
+flowchart LR
+    subgraph localPlan ["方案一：本地部署"]
+        localEmb["SentenceTransformer BGE/MiniLM"] --> localChroma[ChromaDB 本地持久化]
+        localChroma --> localLLM["Ollama / 本地 LLM"]
+        localRerank["CrossEncoder BGE-reranker 可选"] -.-> localChroma
+    end
+
+    subgraph apiPlan ["方案二：第三方 API"]
+        apiEmb["OpenAI Embeddings API"] --> apiChroma[ChromaDB 本地持久化]
+        apiChroma --> apiLLM["GPT-4o / Claude 等"]
+        apiRerank["Cohere Rerank API 可选"] -.-> apiChroma
+    end
+
+    kbDocs[知识库文档] --> localPlan
+    kbDocs --> apiPlan
+    userQ[用户问题] --> localPlan
+    userQ --> apiPlan
+```
+
+### 单次问答时序
+
+```mermaid
+sequenceDiagram
+    participant U as 用户
+    participant App as RAG应用
+    participant Emb as Embedding模型
+    participant DB as ChromaDB
+    participant RR as Reranker可选
+    participant LLM as 大语言模型
+
+    U->>App: 提问
+    App->>Emb: Query 转向量
+    Emb-->>App: query_embedding
+    App->>DB: query n_results=20
+    DB-->>App: Top-20 候选文档
+    opt 启用 Rerank
+        App->>RR: 对 query-doc 逐对打分
+        RR-->>App: 重排后 Top-5
+    end
+    App->>App: 拼接 Prompt
+    App->>LLM: 发送 Prompt
+    LLM-->>App: 生成答案
+    App-->>U: 返回答案
+```
+
+### 关键组件说明
+
+| 组件 | 作用 | 本文对应工具 |
+|------|------|-------------|
+| **Chunking** | 把长文档切成可检索的小块 | `langchain-text-splitters` |
+| **Bi-Encoder** | 快速向量化，用于初次召回 | BGE-small / OpenAI Embeddings |
+| **Vector DB** | 存储并检索向量 | ChromaDB（本文两种方案均为本地 `PersistentClient`） |
+| **Cross-Encoder** | 精准重排，可选 | BGE-reranker / Cohere Rerank |
+| **LLM** | 基于上下文生成自然语言答案 | Ollama / GPT-4o |
+
 作为技术决策的参考，对这两种方案的可行性要点总结如下：
 
 
@@ -8,7 +96,7 @@
 | ----------- | --------------------------------------- | --------------------------------------------- |
 | **✅ 技术可行性** | 高度可行，技术成熟，文档完善，已成为RAG实践的主流标准。           | 高度可行，所有主流模型提供商均提供功能完备的API，已为开发者广泛采用。          |
 | **💰 成本评估** | 前期主要为硬件/服务器成本。长期高频使用成本更低，不受API按次计费模式影响。 | 按量付费，无需硬件投入，但大规模使用时成本会显著增加，精确地说是“成本随使用量线性增长”。 |
-| **⚙️ 运维负担** | **中/高**：团队需负责部署、维护、监控、扩展整个系统。           | **低**：向量数据库和LLM服务均由供应商托管，近乎免运维。               |
+| **⚙️ 运维负担** | **中/高**：团队需负责部署、维护、监控、扩展整个系统（含本地 ChromaDB）。 | **低/中**：LLM 与 Embedding 由供应商托管；**ChromaDB 在本文两种方案中均为本地 PersistentClient 部署**，向量库需自行维护。若改用 Pinecone 等托管向量库，运维可进一步降低。 |
 | **🔒 数据安全** | **高**：数据在本地闭环处理，满足金融、医疗等对数据私密性有严格要求的场景。 | **低/中**：敏感数据传输和处理依赖于服务商的安全合规能力，需经过严格审查。       |
 | **🚀 部署效率** | **低**：需要从零搭建和配置整个环境。                    | **高**：开箱即用，通过API Key即可快速集成，适合敏捷开发和概念验证。       |
 
@@ -34,6 +122,15 @@
 
 完成环境准备后，针对两种模式，具体操作流程如下。
 
+**文档切分（Chunking）示例**：在向量化之前，需将长文档切分为小块：
+
+```python
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+chunks = splitter.split_text(raw_document)  # raw_document 为完整文档字符串
+```
+
 ---
 
 #### 🖥️ 方案一：本地部署环境
@@ -41,7 +138,9 @@
 此方案适用于数据敏感、有长期高频使用或离线运行需求的场景。
 
 **1. 嵌入模型选择**
-可以选用轻量化的BGE-small或“all-MiniLM-L6-v2”（生成384维向量），或精度更高的BGE-large（生成1024维向量）。如需处理中文文档，`shibing624/text2vec-base-chinese` 是一个较好的选择。
+可以选用轻量化的 BGE-small 或 `all-MiniLM-L6-v2`（生成 384 维向量），或精度更高的 BGE-large（生成 1024 维向量）。**处理中文文档**时推荐 `BAAI/bge-small-zh-v1.5` 或 `shibing624/text2vec-base-chinese`。**索引与查询必须使用同一模型**，且向量维度需与 ChromaDB 集合一致。
+
+> **BGE query instruction**：短 query 检索长文档（s2p 场景）时，可在 query 前加指令前缀以提升召回精度。v1.5 模型不加前缀也可用，但加前缀通常效果更好。文档/passage **不需要**加前缀。
 
 **2. 文档向量化与存储**
 将预处理后的文档分割成块并向量化后，存入ChromaDB。
@@ -56,8 +155,9 @@ client = chromadb.PersistentClient(path="./my_chroma_db")
 # 2. 创建或获取一个集合（类似数据库中的表）
 collection = client.get_or_create_collection(name="my_knowledge_base")
 
-# 3. 加载嵌入模型
-model = SentenceTransformer('BAAI/bge-small-en-v1.5')
+# 3. 加载嵌入模型（中文文档示例）
+model = SentenceTransformer('BAAI/bge-small-zh-v1.5')
+QUERY_INSTRUCTION = "为这个句子生成表示以用于检索相关文章："
 
 # 示例：一批要存入知识库的文档块
 documents = [
@@ -85,8 +185,8 @@ collection.add(
 # 1. 用户查询
 query = "最新的营收数据是多少？"
 
-# 2. 将查询语句转换为向量
-query_embedding = model.encode([query]).tolist()
+# 2. 将查询语句转换为向量（query 可加 instruction 前缀，document 不加）
+query_embedding = model.encode([QUERY_INSTRUCTION + query]).tolist()
 
 # 3. 在ChromaDB中进行相似性检索，k=3表示返回最相似的3个文档
 results = collection.query(
@@ -105,18 +205,19 @@ prompt = f"""基于以下信息回答问题。如果信息不足以回答，请�
 问题：{query}
 回答："""
 
-# 6. 调用本地LLM（如通过Ollama的API）
+# 6. 调用本地 LLM（推荐 /api/chat 接口；以下为 /api/generate 示例）
 import requests, json
-response = requests.post('http://localhost:11434/api/generate', 
+response = requests.post('http://localhost:11434/api/generate',
                          json={"model": "llama2", "prompt": prompt, "stream": False})
 answer = json.loads(response.text)['response']
 print(answer)
+# 生产环境可改用: POST /api/chat + messages 格式，并选用 qwen2.5 等较新模型
 ```
 
 **🔧 ComfyUI 集成方案**
-在ComfyUI的`LLM Party`节点组中，可以通过`词嵌入模型工具`加载本地嵌入模型，并在`IF_ChatPrompt`中启用RAG功能，实现在图像生成工作流中调用本地知识库。具体步骤是：先安装ComfyUI-LLM-Party等插件，然后通过`词嵌入模型工具`和`加载文件`等节点组成RAG工作流。
+在 ComfyUI 的 [comfyui_LLM_party](https://github.com/heshengtao/comfyui_LLM_party) 插件中，可通过「**词嵌入模型加载器**」（Embedding Model Loader）加载本地嵌入模型，配合「**Embeddings_Tool**」节点组成 RAG 工作流；大模型节点可挂载上述工具，在需要时自动检索知识库。安装插件后，通过「词嵌入模型加载器」和「加载文件」等节点即可搭建完整流程。
 
-#### 🌐 方案二：调用第三方LLM API
+#### 🌐 方案二：调用第三方 LLM API
 
 此方案适用于快速原型验证、不想投入运维成本或需要使用GPT-4等顶级模型的场景。
 
@@ -126,6 +227,7 @@ print(answer)
 **2. 向量化与存储**
 
 ```python
+import os
 import chromadb
 from openai import OpenAI
 
@@ -134,7 +236,7 @@ client = chromadb.PersistentClient(path="./my_chroma_db")
 collection = client.get_or_create_collection(name="my_knowledge_base")
 
 # 初始化OpenAI客户端
-openai_client = OpenAI(api_key="YOUR_OPENAI_API_KEY")
+openai_client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
 # 准备文档
 documents = ["公司2024年Q3财报显示营收1000万美元。", "公司2024年Q4财报显示营收1200万美元。"]
@@ -174,7 +276,12 @@ print(completion.choices[0].message.content)
 
 ### 💡 AIGC场景的RAG应用
 
-虽然RAG在LLM领域应用更广，但在AIGC领域，我们可以借鉴其思想，在`ComfyUI-IF_AI_tools`这类插件中，利用RAG流程增强模型的图像生成能力。例如，用户可以搭建一个RAG工作流：先用Loader节点加载产品手册等风格文档，再由LLM分析并补充提示词，最后引导SD生成符合规范的设计图。
+虽然 RAG 在 LLM 领域应用更广，但在 AIGC 领域同样可以借鉴其思想：
+
+- **[comfyui_LLM_party](https://github.com/heshengtao/comfyui_LLM_party)**：支持词向量 RAG，可在 LLM 工作流中检索风格/产品文档并增强提示词。
+- **ComfyUI-IF_AI_tools** 等其他插件：提供独立的 Loader + LLM 提示词增强能力，思路类似但节点命名与工作流不同。
+
+例如：用 Loader 节点加载产品手册等风格文档，由 LLM 分析并补充提示词，最后引导 SD 生成符合规范的设计图。
 
 ### ⚡ 关键的可行性评估：成本与延迟
 
@@ -182,7 +289,7 @@ print(completion.choices[0].message.content)
 
 - **成本估算**
   - **本地部署**：**一次性硬件成本**（GPU服务器，约￥2-6万/台）+ **运维成本**（人员与电费）。长期大规模使用均摊成本更低。
-  - **API调用**：**向量生成费**（约$0.00013/1K tokens）+ **LLM调用费**（GPT-4o约$2.5/1M input tokens）+ **向量存储费**（约$0.1-1/GB/月）。按1万次查询（平均1K token上下文）估算，**每月成本在$30-$100**。
+  - **API调用**：**向量生成费**（约$0.00013/1K tokens）+ **LLM调用费**（GPT-4o约$2.5/1M input tokens）。本文方案中 ChromaDB 为本地持久化，**向量存储成本为本地磁盘占用**；若改用 Pinecone 等托管向量库，才产生约 $0.1–1/GB/月的云存储费。按1万次查询（平均1K token上下文）估算，**每月 API 成本约在 $30–$100**（不含本地硬件）。
 - **延迟组成**
   - 一次完整的RAG请求通常包含：**检索延迟**（本地约50-100ms，API取决于网络）+ **LLM推理延迟**（本地取决于GPU算力，API取决于服务端负载）。总时长通常在**2-10秒**之间。
 
@@ -195,7 +302,7 @@ print(completion.choices[0].message.content)
 ---
 
 
-# 后续优化(Rerank技术补充) #
+## 后续优化：Rerank 技术补充
 
 
 在上一轮关于RAG的流程描述中，为了让PM能够快速理解核心链路（检索→生成），有意简化了**检索后的重排序（Rerank）**步骤。
@@ -212,7 +319,7 @@ print(completion.choices[0].message.content)
 - 与查询词向量接近但逻辑无关的内容
 
 **Rerank的任务**：用一个更精准的模型（通常是交叉编码器 Cross-Encoder）对召回的候选集（比如20个）进行**逐一打分重排**，输出Top K（比如5个）给LLM生成答案。  
-**效果提升**：Rerank能让首条命中率提升20%~40%，尤其适用于长文档、混合主题、专业术语多的情况。
+**效果提升**：Rerank 能让首条命中率提升 20%~40%（视场景与基准数据集而定），尤其适用于长文档、混合主题、专业术语多的情况。
 
 ---
 
@@ -282,29 +389,31 @@ final_context = "\n\n".join(reranked_docs[:5])
 **技术选型**：
 - **Cohere Rerank API**（行业标杆，支持多语言）
 - **OpenAI 目前不单独提供rerank API**，但可通过其 `gpt-4o` 来做零样本打分（成本高，不推荐）
-- **Jina AI Reranker API**（开源模型免费？实际有免费额度）
+- **Jina AI Reranker API**（按调用量计费，有免费试用额度）
 
 **具体操作步骤（以Cohere为例）**：
 
 ```python
+import os
 import cohere
 
-co = cohere.Client(api_key="YOUR_COHERE_API_KEY")
+co = cohere.Client(api_key=os.environ.get("COHERE_API_KEY"))
 
-# 1. 假设已经从ChromaDB召回20个候选文档
+# 1. 假设已经从 ChromaDB 召回 20 个候选文档
 candidate_docs = [...]  # list of strings
 
-# 2. 调用Cohere rerank API
+# 2. 调用 Cohere rerank API（中文场景用 multilingual 模型）
 response = co.rerank(
     query="最新的营收数据是多少？",
     documents=candidate_docs,
-    top_n=5,               # 直接返回重排后的前5个
-    model="rerank-english-v3.0"  # 或 rerank-multilingual-v3.0
+    top_n=5,
+    model="rerank-multilingual-v3.0"
 )
 
-# 3. 提取重排后的文档列表
-reranked_docs = [doc.document.text for doc in response.results]  # 具体属性名可能略有差异
-# 每个result还包含原index和relevance_score
+# 3. 提取重排后的文档列表（传字符串列表时 document 字段可能为 None，用 index 回查）
+reranked_docs = [candidate_docs[r.index] for r in response.results]
+# 备选：设置 return_documents=True 时，可尝试 r.document.text
+# 每个 result 还包含 relevance_score
 ```
 
 **费用**：Cohere Rerank API 按每1000个文档计费（约$2/1000次请求，每次请求可含多个文档）。对于百万级查询的场景成本较高，适合中小规模或对精度要求极高的业务。
@@ -336,19 +445,19 @@ reranked_docs = [doc.document.text for doc in response.results]  # 具体属性�
 **场景**：调用Midjourney/Replicate/Stable Diffusion API时，需要对生成的多张图进行筛选。
 
 **实现方法**：
-- 利用API返回的多张图（如 `n=4`）后，本地调用一个轻量级CLIP模型（通过Hugging Face Inference API）计算每张图与目标文本的相关性，再选取最优。
+- 利用 API 返回的多张图（如 `n=4`）后，本地调用轻量级 CLIP 模型（通过 `huggingface_hub.InferenceClient`）计算每张图与目标文本的相关性，再选取最优。
 - 或者使用 **Replicate的`blip-2`模型** 生成图像描述，再与用户提示词做文本相似度比对（效率较低，不常用）。
 
-**代码片段**（使用Hugging Face Free Inference API打分）：
+**代码片段**（使用 Hugging Face InferenceClient 打分；旧版 `api-inference.huggingface.co` 已下线）：
 ```python
-import requests
+import os
+from huggingface_hub import InferenceClient
 
-API_URL = "https://api-inference.huggingface.co/models/openai/clip-vit-base-patch32"
-headers = {"Authorization": "Bearer YOUR_HF_TOKEN"}
+client = InferenceClient(token=os.environ.get("HF_TOKEN"))
 
 def clip_score(image_bytes, text):
-    response = requests.post(API_URL, headers=headers, json={"inputs": {"image": image_bytes, "text": text}})
-    return response.json()  # 返回相似度分数
+    # 具体调用方式取决于所选 CLIP 模型与任务类型，请参考 huggingface_hub 文档
+    return client.zero_shot_image_classification(image_bytes, candidate_labels=[text])
 ```
 
 ---
@@ -370,5 +479,5 @@ def clip_score(image_bytes, text):
 | 知识库条目短（<100词）、主题单一 | 不需要 | 直接取Top 3 |
 | 知识库长文档（>2000词）、内容混合 | **需要** | 本地 BGE-reranker |
 | 查询多为复杂逻辑问题（含否定/条件） | **需要** | Cohere API 或 本地CrossEncoder |
-| 对响应延迟要求极高（<1秒） | 不需要 | 增大召回数（如20→5）代替rerank |
+| 对响应延迟要求极高（<1秒） | 不需要 | 直接取 Top 3–5，跳过 Rerank，优先降低延迟 |
 | AIGC风格素材库匹配 | **需要** | 本地 CLIP Score 重排 |
